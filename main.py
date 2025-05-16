@@ -23,7 +23,7 @@ app.add_middleware(
 
 # Replace with your actual API key
 # In production, use environment variables: os.environ.get("GROK_API_KEY")
-GROK_API_KEY = xai-mPXLmlWr6d2g7BcNmLAiJvm1TSjAxFQvOtHR2105uq46iducE5BgMj9NbvFDnqcdhkpKMcXpk1bnk5Lo
+GROK_API_KEY = "key"
 GROQ_API_URL= https://api.groq.com/openai/v1/chat/completions  # Replace with actual Grok API URL
 
 # ----- Models -----
