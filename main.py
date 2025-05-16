@@ -2,7 +2,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import openai
+import requests
 import json
 from typing import Dict, Any, List, Optional
 import random
@@ -22,8 +22,9 @@ app.add_middleware(
 )
 
 # Replace with your actual API key
-# In production, use environment variables: os.environ.get("OPENAI_API_KEY")
-openai.api_key = "your-openai-api-key"
+# In production, use environment variables: os.environ.get("GROK_API_KEY")
+GROK_API_KEY = xai-mPXLmlWr6d2g7BcNmLAiJvm1TSjAxFQvOtHR2105uq46iducE5BgMj9NbvFDnqcdhkpKMcXpk1bnk5Lo
+GROQ_API_URL= https://api.groq.com/openai/v1/chat/completions  # Replace with actual Grok API URL
 
 # ----- Models -----
 
