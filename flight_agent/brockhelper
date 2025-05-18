@@ -1,0 +1,213 @@
+import os
+import re
+import json
+import requests
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# API configuration
+API_URL = os.getenv("API_URL", "https://api.groq.com/openai/v1/chat/completions")
+API_KEY = os.getenv("GROQ_API_KEY")
+DEFAULT_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+
+# Initialize headers
+def get_headers():
+    return {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+def groq_ai_call(prompt, model=None, temperature=0.7, max_tokens=1024):
+    """
+    Make a call to the Groq API with the given prompt.
+    
+    Args:
+        prompt (str): The prompt to send to the API.
+        model (str, optional): The model to use. Defaults to environment variable.
+        temperature (float, optional): Controls randomness. Defaults to 0.7.
+        max_tokens (int, optional): Maximum tokens in response. Defaults to 1024.
+        
+    Returns:
+        str: The API response content.
+    """
+    if not API_KEY:
+        raise ValueError("GROQ_API_KEY environment variable is not set")
+    
+    # Use provided model or fall back to default
+    model_to_use = model or DEFAULT_MODEL
+    
+    data = {
+        "model": model_to_use,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_completion_tokens": max_tokens,
+        "top_p": 1,
+        "stream": False,
+    }
+    
+    try:
+        response = requests.post(API_URL, headers=get_headers(), json=data)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"API call failed: {str(e)}")
+    except (KeyError, IndexError) as e:
+        raise Exception(f"Error parsing API response: {str(e)}")
+
+def extract_parameters_from_user_input(user_input):
+    """
+    Extract travel parameters from user input using Groq LLM.
+    
+    Args:
+        user_input (str): User's natural language query about travel.
+        
+    Returns:
+        dict: Extracted travel parameters.
+    """
+    prompt = f"""
+Extract the following travel parameters from the user input and return ONLY valid JSON (no markdown or explanation):
+- location (city or destination)
+- arrival_date (format YYYY-MM-DD)
+- departure_date (format YYYY-MM-DD)
+- guest_qty (number of adult guests, default to 2)
+- children_qty (number of children, default to 0)
+- children_age (list of integers for children's ages, empty list if none)
+- travel_purpose (business or leisure, default to leisure)
+
+Assume all dates are MM/DD/YYYY and convert to YYYY-MM-DD.
+If dates are missing, use next month for arrival and departure (3-day stay).
+If location is missing, return an error field.
+
+User input: {user_input}
+
+Respond with JSON only.
+"""
+    response = groq_ai_call(prompt)
+    
+    # Remove markdown if present and extract JSON
+    match = re.search(r"\{.*\}", response, re.DOTALL)
+    content = match.group(0) if match else response.strip()
+    
+    try:
+        params = json.loads(content)
+        
+        # Ensure all required fields are present with defaults
+        if "guest_qty" not in params:
+            params["guest_qty"] = 2
+        if "children_qty" not in params:
+            params["children_qty"] = 0
+        if "children_age" not in params:
+            params["children_age"] = []
+        if "travel_purpose" not in params:
+            params["travel_purpose"] = "leisure"
+            
+        return params
+    except json.JSONDecodeError:
+        raise ValueError("Failed to parse parameters from Groq response")
+
+def get_best_booking_url(hotel: dict) -> str | None:
+    """
+    Determine the best Booking.com URL for a hotel.
+    Order of preference:
+    1. Direct known URL fields from API response
+    2. Construct URL from hotel_slug or url_slug if available
+    3. Use hotel's own website URL if valid
+    4. Fallback: Google search link for hotel name + city
+    Returns:
+        URL string or None if no suitable URL found.
+    """
+    url_fields = [
+        "booking_url",
+        "deep_link",
+        "affiliate_url",
+        "url",
+        "composite_url",
+        "click_url",
+    ]
+    # Check direct URLs first
+    for field in url_fields:
+        url = hotel.get(field)
+        if url and url.startswith("http"):
+            return url
+    # Try to construct Booking.com URL from slug
+    slug = hotel.get("hotel_slug") or hotel.get("url_slug")
+    if slug:
+        return f"https://www.booking.com/hotel/us/{slug}.html"
+    # Check hotel's own website URL
+    website = hotel.get("hotel_website")
+    if website and website.startswith("http"):
+        return website
+    # Last resort: Google search link
+    name = hotel.get("hotel_name") or hotel.get("name")
+    city = hotel.get("city") or hotel.get("location")
+    if name:
+        query = "+".join(name.split())
+        if city:
+            query += "+" + "+".join(city.split())
+        return f"https://www.google.com/search?q={query}"
+    return None
+
+def summarize_hotels(hotel_data: dict, filters: dict, user_input: str) -> str:
+    """
+    Summarizes hotel options with booking links.
+    Args:
+        hotel_data: Raw hotel response from Booking.com API.
+        filters: Parameters used for search (location, dates, guests).
+        user_input: Original user input string.
+    Returns:
+        A friendly summary string with hotel names and booking URLs.
+    """
+    # Try common keys for hotel list
+    hotels = hotel_data.get('result') or hotel_data.get('results') or hotel_data.get('properties') or []
+    
+    if not hotels:
+        return "No hotels found matching your criteria."
+    
+    # Format dates for display
+    arrival = filters.get("arrival_date", "")
+    departure = filters.get("departure_date", "")
+    location = filters.get("location", "")
+    
+    summary = f"### Hotel Options in {location}\n"
+    summary += f"🗓️ Stay: {arrival} to {departure}\n"
+    summary += f"👥 Guests: {filters.get('guest_qty', 2)} adults, {filters.get('children_qty', 0)} children\n\n"
+    
+    hotel_list = []
+    for i, hotel in enumerate(hotels[:5], 1):  # Limit top 5 hotels
+        name = hotel.get("hotel_name", "Unnamed Hotel")
+        price = hotel.get("min_total_price", hotel.get("price_breakdown", {}).get("gross_price", "N/A"))
+        if isinstance(price, dict):
+            price = price.get("value", "N/A")
+            
+        url = get_best_booking_url(hotel)
+        
+        summary += f"**Option {i}: {name}**\n"
+        summary += f"💲 Price: ${price if price != 'N/A' else 'Price unavailable'}\n"
+        
+        # Add rating if available
+        rating = hotel.get("review_score", hotel.get("rating", ""))
+        if rating:
+            summary += f"⭐ Rating: {rating}/10\n"
+            
+        # Add location if available
+        address = hotel.get("address", hotel.get("hotel_address", ""))
+        if address:
+            summary += f"📍 {address}\n"
+            
+        # Add booking link
+        if url:
+            summary += f"[🔗 Book this hotel]({url})\n"
+        else:
+            summary += "No booking link available\n"
+            
+        summary += "\n"
+    
+    return summary
+
+if __name__ == "__main__":
+    # Test the API
+    test_input = "I need a hotel in New York from June 15 to June 20 for 2 adults and 1 child age 7"
+    params = extract_parameters_from_user_input(test_input)
+    print(json.dumps(params, indent=2))
