@@ -1,13 +1,9 @@
-import requests
 import os
-import re
-from dotenv import load_dotenv
+import json
+import requests
 from datetime import datetime
-import logging
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger('flight_agent')
+from dotenv import load_dotenv
+from groq_api import groq_ai_call
 
 # Load environment variables
 load_dotenv()
@@ -15,12 +11,12 @@ RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
 
 class FlightAgent:
     def __init__(self):
+        """Initialize the flight agent with API credentials and SkyID mappings."""
         self.api_key = RAPIDAPI_KEY
         if not self.api_key:
-            logger.warning("RAPIDAPI_KEY is not set. API calls will fail.")
+            print("WARNING: RAPIDAPI_KEY is not set. API calls will fail.")
         
-        # Store SkyID mappings - these would need to be populated with actual values
-        # from /get-config endpoint in a production system
+        # Common city to SkyID mappings
         self.sky_id_map = {
             "new york": "NYCA",
             "los angeles": "LAXA",
@@ -42,78 +38,66 @@ class FlightAgent:
             "philadelphia": "PHLA",
             "detroit": "DETA",
             "portland": "PDXA",
-            "paris": "PARI"  # Example from API docs
+            "paris": "PARI"
         }
         
     def _get_sky_id(self, city):
-        """
-        Convert city name to SkyScanner skyId format
-        """
-        city = city.lower()
+        """Convert city name to SkyScanner skyId format."""
+        if not city:
+            return None
+            
+        city = city.lower().strip()
         return self.sky_id_map.get(city, city.upper() + "A")  # Fallback format
 
-    def extract_flight_details(self, query):
-        """
-        Extract flight details from natural language query
-        """
-        origin_match = re.search(r'from\s+([A-Za-z\s]+?)\s+to', query)
-        dest_match = re.search(r'to\s+([A-Za-z\s]+?)(?:\s|\.|$)', query)
+    def extract_flight_parameters(self, user_query):
+        """Use Groq LLM to extract structured flight parameters from user query."""
+        prompt = f"""
+        Extract the following flight parameters from the user input and return ONLY valid JSON (no markdown or explanation):
+        - originCity (the departure city)
+        - destinationCity (the arrival city)
+        - departureDate (format YYYY-MM-DD)
+        - returnDate (format YYYY-MM-DD, optional)
+        - passengers (number of passengers, default to 1)
+        - cabinClass (economy, business, or first, default to economy)
         
-        # More complex date patterns
-        date_match = re.search(r'from\s+(\w+)\s+(\d+)(?:st|nd|rd|th)?\s+to\s+(\w+)\s+(\d+)(?:st|nd|rd|th)?', query, re.IGNORECASE)
-        if not date_match:
-            date_match = re.search(r'(\w+)\s+(\d+)(?:st|nd|rd|th)?\s+to\s+(\w+)\s+(\d+)(?:st|nd|rd|th)?', query, re.IGNORECASE)
+        Assume dates are in MM/DD/YYYY format and convert to YYYY-MM-DD.
+        If dates aren't specified, assume they're for next month.
         
-        budget_match = re.search(r'budget\s+(?:is\s+|of\s+)?[$]?(\d+)', query)
-        people_match = re.search(r'(\d+)\s+(?:people|persons|passengers)', query)
-
-        origin = origin_match.group(1).strip() if origin_match else ""
-        destination = dest_match.group(1).strip() if dest_match else ""
-
-        current_year = datetime.now().year
-        depart = return_ = None
-        if date_match:
-            try:
-                depart_month = datetime.strptime(date_match.group(1), '%B').month
-            except ValueError:
-                # Try abbreviated month name
-                try:
-                    depart_month = datetime.strptime(date_match.group(1), '%b').month
-                except ValueError:
-                    depart_month = None
-                    
-            try:
-                return_month = datetime.strptime(date_match.group(3), '%B').month
-            except ValueError:
-                # Try abbreviated month name
-                try:
-                    return_month = datetime.strptime(date_match.group(3), '%b').month
-                except ValueError:
-                    return_month = None
-                
-            if depart_month and return_month:
-                depart = f"{current_year}-{depart_month:02d}-{int(date_match.group(2)):02d}"
-                return_ = f"{current_year}-{return_month:02d}-{int(date_match.group(4)):02d}"
-
-        budget = float(budget_match.group(1)) if budget_match else None
-        passengers = int(people_match.group(1)) if people_match else 1
-
-        return {
-            "origin": origin,
-            "destination": destination,
-            "departure_date": depart,
-            "return_date": return_,
-            "budget": budget,
-            "passengers": passengers,
-            "flight_budget": 0.4 * budget if budget else None
-        }
-
-    def get_flights(self, origin, destination, departure_date, return_date=None, passengers=1):
+        User input: {user_query}
+        
+        Respond with JSON only.
         """
-        Search for flights using the Fly Scraper API with proper parameters
+        
+        try:
+            response = groq_ai_call(prompt)
+            # Parse the JSON response
+            return json.loads(response)
+        except Exception as e:
+            print(f"Error extracting flight parameters: {e}")
+            return {}
+
+    def get_flights(self, params):
         """
+        Search for flights using the FlyScraper API with proper parameters
+        """
+        # Extract required parameters
+        origin = params.get("originCity")
+        destination = params.get("destinationCity")
+        departure_date = params.get("departureDate")
+        return_date = params.get("returnDate")
+        passengers = params.get("passengers", 1)
+        cabin_class = params.get("cabinClass", "economy")
+        
+        # Validate required parameters
+        if not all([origin, destination, departure_date]):
+            return {"error": "Missing required parameters (origin, destination, or departure date)"}
+        
+        # Convert city names to SkyIDs
         origin_sky_id = self._get_sky_id(origin)
         dest_sky_id = self._get_sky_id(destination)
+        
+        if not origin_sky_id or not dest_sky_id:
+            return {"error": "Failed to map city names to SkyIDs"}
 
         url = "https://flyscraper.p.rapidapi.com/flight/search"
         headers = {
@@ -121,56 +105,47 @@ class FlightAgent:
             "X-RapidAPI-Host": "flyscraper.p.rapidapi.com"
         }
         
-        # Format date as required by API (YYYY-MM-DD)
-        departure_formatted = departure_date
-        
         # Set up query parameters according to API documentation
-        params = {
+        api_params = {
             "originSkyId": origin_sky_id,
             "destinationSkyId": dest_sky_id,
-            "departureDate": departure_formatted,
+            "departureDate": departure_date,
             "adults": passengers,
-            "cabinClass": "economy",
+            "cabinClass": cabin_class.lower(),
             "currency": "USD",
             "sort": "best"  # Default to best flights
         }
 
-        logger.info(f"Searching flights: {origin_sky_id} -> {dest_sky_id} on {departure_formatted}")
+        print(f"Searching flights: {origin_sky_id} -> {dest_sky_id} on {departure_date}")
         
         try:
-            response = requests.get(url, headers=headers, params=params)
-            logger.info(f"API request URL: {response.url}")
+            response = requests.get(url, headers=headers, params=api_params)
+            print(f"API request URL: {response.url}")
             response.raise_for_status()
             
             data = response.json()
             
-            # Check if we need to handle incomplete results
-            if data.get("data", {}).get("context", {}).get("status") == "incomplete":
-                # In a real implementation, you'd call the /flight/search-incomplete endpoint
-                # until the status is 'complete', but for simplicity we'll just return what we have
-                logger.warning("Received incomplete results. In production, should poll until complete.")
+            # Process the flight results
+            processed_flights = self._process_flight_results(data)
+            return processed_flights
             
-            # Process the flight results to extract useful information
-            return self._process_flight_results(data, return_date)
         except Exception as e:
-            logger.error(f"Error getting flights: {str(e)}")
+            print(f"Error getting flights: {str(e)}")
             return {"error": str(e)}
 
-    def _process_flight_results(self, api_response, return_date=None):
-        """
-        Process and simplify the flight API response
-        """
+    def _process_flight_results(self, api_response):
+        """Process and simplify the flight API response."""
         try:
             # Check if we have itineraries
             itineraries = api_response.get("data", {}).get("itineraries", [])
             
             if not itineraries:
-                return {"data": [], "count": 0, "message": "No flights found"}
+                return {"flights": [], "count": 0, "message": "No flights found"}
             
             processed_flights = []
             
             # Extract relevant flight information
-            for itinerary in itineraries[:10]:  # Limit to top 10 flights
+            for itinerary in itineraries[:5]:  # Limit to top 5 flights
                 legs = itinerary.get("legs", [])
                 if not legs:
                     continue
@@ -196,53 +171,84 @@ class FlightAgent:
                 stop_count = leg.get("stopCount", 0)
                 duration = leg.get("durationInMinutes", 0)
                 
+                # Format duration to hours and minutes
+                hours, minutes = divmod(duration, 60)
+                duration_formatted = f"{hours}h {minutes}m"
+                
+                # Get booking URL or link information if available
+                booking_info = price_info.get("url", "") or price_info.get("deepLink", "")
+                
                 processed_flight = {
                     "airline": airline_name,
                     "flightNumber": flight_number,
-                    "price": price,
+                    "price": f"${price}",
                     "departureTime": departure_time,
                     "arrivalTime": arrival_time,
                     "stops": stop_count,
-                    "duration": duration,
+                    "duration": duration_formatted,
+                    "bookingLink": booking_info,
                     "itineraryId": itinerary.get("id", "")
                 }
                 
                 processed_flights.append(processed_flight)
             
             return {
-                "data": processed_flights,
+                "flights": processed_flights,
                 "count": len(processed_flights)
             }
             
         except Exception as e:
-            logger.error(f"Error processing flight results: {str(e)}")
-            return {"data": [], "count": 0, "error": str(e)}
+            print(f"Error processing flight results: {str(e)}")
+            return {"flights": [], "count": 0, "error": str(e)}
 
+    def summarize_flights(self, flight_data, params, user_query):
+        """Generate a user-friendly summary of flight options."""
+        if "error" in flight_data:
+            return f"Sorry, there was an error finding flights: {flight_data['error']}"
+            
+        flights = flight_data.get("flights", [])
+        if not flights:
+            return "Sorry, no flights were found matching your criteria."
+            
+        # Create a nice summary with markdown formatting
+        summary = f"### Flight Options from {params.get('originCity')} to {params.get('destinationCity')}\n"
+        summary += f"🗓️ Departure: {params.get('departureDate')}\n\n"
+        
+        for i, flight in enumerate(flights, 1):
+            summary += f"**Option {i}: {flight['airline']}** - {flight['flightNumber']}\n"
+            summary += f"💲 Price: {flight['price']}\n"
+            summary += f"⏰ Departure: {flight['departureTime']} → Arrival: {flight['arrivalTime']}\n"
+            summary += f"⏱️ Duration: {flight['duration']} | Stops: {flight['stops']}\n"
+            
+            if flight.get('bookingLink'):
+                summary += f"[🔗 Book this flight]({flight['bookingLink']})\n"
+                
+            summary += "\n"
+            
+        return summary
+            
     def get_flight_recommendations(self, user_query):
-        """
-        Main function to extract details from query and get flight recommendations
-        """
-        details = self.extract_flight_details(user_query)
-        logger.info(f"Extracted details: {details}")
-
-        if not all([details['origin'], details['destination'], details['departure_date']]):
-            return {"error": "Missing critical info (origin, destination, or date) in query.", "details": details}
-
-        result = self.get_flights(
-            details["origin"],
-            details["destination"],
-            details["departure_date"],
-            details["return_date"],
-            details["passengers"]
-        )
-
-        return {**result, "extracted": details}
+        """Main function to extract details from query and get flight recommendations."""
+        # Extract parameters from user query using Groq
+        params = self.extract_flight_parameters(user_query)
+        print(f"Extracted flight parameters: {params}")
+        
+        # Get flights based on extracted parameters
+        flight_data = self.get_flights(params)
+        
+        # Generate a user-friendly summary
+        summary = self.summarize_flights(flight_data, params, user_query)
+        
+        return {
+            "parameters": params,
+            "flight_data": flight_data,
+            "summary": summary
+        }
 
 
 # Example usage
 if __name__ == "__main__":
     agent = FlightAgent()
-    result = agent.get_flight_recommendations(
-        "plan me a 3 day trip to Dallas, Texas from New York from July 10th to July 13th, 2025. Budget is 500 for 2 people"
-    )
-    print(result)
+    query = input("Tell me about your flight plans: ")
+    result = agent.get_flight_recommendations(query)
+    print("\n" + result["summary"])
