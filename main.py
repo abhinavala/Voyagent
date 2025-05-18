@@ -1,141 +1,76 @@
-import os
+from booking_api import get_hotels
+from flight_agent import FlightAgent
+from groq_api import extract_parameters_from_user_input, summarize_hotels
+from utils import ensure_dates_not_past
 import json
-import requests
-from datetime import datetime
-from dotenv import load_dotenv
-from groq import Groq
-import logging
+import argparse
+import re
 
-# Load .env variables
-load_dotenv()
+def determine_query_type(user_input):
+    """Determine if the query is about flights, hotels, or both."""
+    user_input = user_input.lower()
+    
+    # Check for flight-related keywords
+    flight_keywords = ["flight", "fly", "plane", "airline", "airport", "departure", "arrival"]
+    hotel_keywords = ["hotel", "stay", "accommodation", "room", "lodge", "resort", "book a room"]
+    
+    flight_score = sum(1 for keyword in flight_keywords if keyword in user_input)
+    hotel_score = sum(1 for keyword in hotel_keywords if keyword in user_input)
+    
+    # If both flight and hotel keywords are present, assume it's a trip (both)
+    if flight_score > 0 and hotel_score > 0:
+        return "trip"
+    elif flight_score > hotel_score:
+        return "flight"
+    else:
+        return "hotel"  # Default to hotel if can't determine
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("flight_agent")
-
-# API keys
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-70b-8192")
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
-
-class FlightAgent:
-    def __init__(self):
-        self.api_key = RAPIDAPI_KEY
-        self.groq = Groq(api_key=GROQ_API_KEY)
-        self.sky_id_map = {
-            "new york": "NYCA", "dallas": "DFWA", "paris": "PARI",
-            "los angeles": "LAXA", "san francisco": "SFOA", "san jose": "SJCA"
-        }
-
-    def _get_sky_id(self, city):
-        city = city.lower().strip()
-        return self.sky_id_map.get(city, city.upper() + "A")
-
-    def extract_with_groq(self, user_query):
-        prompt = f"""
-        Extract structured flight info from the query below.
-        Return ONLY valid JSON in this format and nothing else (no markdown or extra explanation):
-
-        {{
-          "originCity": "string",
-          "destinationCity": "string",
-          "departureDate": "YYYY-MM-DD",
-          "returnDate": "YYYY-MM-DD",
-          "passengers": number
-        }}
-
-        Query: {user_query}
-        """
-
+def main():
+    parser = argparse.ArgumentParser(description="Travel Assistant - Find flights and hotels")
+    parser.add_argument("--type", choices=["flight", "hotel", "trip", "auto"], default="auto",
+                        help="Specify search type (flight, hotel, trip, or auto-detect)")
+    args, remaining = parser.parse_known_args()
+    
+    # Get user input either from command line args or interactively
+    if remaining:
+        user_input = " ".join(remaining)
+    else:
+        user_input = input("✈️ Tell me about your travel plans: ")
+    
+    # Determine what type of search to perform
+    query_type = args.type
+    if query_type == "auto":
+        query_type = determine_query_type(user_input)
+        print(f"\n🔍 Query detected as: {query_type.upper()}")
+    
+    # Perform search based on type
+    if query_type in ["hotel", "trip"]:
+        # Hotel search
         try:
-            res = self.groq.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            content = res.choices[0].message.content.strip()
-            print("\n🧪 Raw Groq Output:\n", content)
-            return json.loads(content)
+            hotel_params = extract_parameters_from_user_input(user_input)
+            hotel_params = ensure_dates_not_past(hotel_params)
+            print(f"\n🏨 Searching hotels for: {hotel_params.get('location')}")
+            print(f"📅 Dates: {hotel_params.get('arrival_date')} to {hotel_params.get('departure_date')}")
+            
+            hotel_data = get_hotels(hotel_params)
+            hotel_summary = summarize_hotels(hotel_data, hotel_params, user_input)
+            print("\n📋 Hotel Options:\n")
+            print(hotel_summary)
         except Exception as e:
-            logger.error(f"GROQ parsing error: {e}")
-            return {}
-
-    def get_flights(self, origin, destination, departure_date, return_date=None, passengers=1):
-        url = "https://flyscraper.p.rapidapi.com/flight/search"
-        headers = {
-            "X-RapidAPI-Key": self.api_key,
-            "X-RapidAPI-Host": "flyscraper.p.rapidapi.com"
-        }
-
-        params = {
-            "originSkyId": self._get_sky_id(origin),
-            "destinationSkyId": self._get_sky_id(destination),
-            "departureDate": departure_date,
-            "adults": passengers,
-            "cabinClass": "economy",
-            "currency": "USD",
-            "sort": "best"
-        }
-
-        logger.info(f"Querying FlyScraper: {params}")
+            print(f"Error with hotel search: {e}")
+    
+    if query_type in ["flight", "trip"]:
+        # Flight search
         try:
-            response = requests.get(url, headers=headers, params=params)
-            response.raise_for_status()
-            return response.json()
+            flight_agent = FlightAgent()
+            flight_results = flight_agent.get_flight_recommendations(user_input)
+            
+            print("\n✈️ Flight Options:\n")
+            print(flight_results["summary"])
         except Exception as e:
-            logger.error(f"FlyScraper API error: {e}")
-            return {"error": str(e)}
+            print(f"Error with flight search: {e}")
 
-    def format_response_with_groq(self, user_query, flight_data):
-        prompt = f"""
-        You are a helpful travel agent. The user asked:
-        "{user_query}"
-
-        Here is the flight data in JSON:
-        {json.dumps(flight_data)}
-
-        Summarize the top result conversationally. If flights aren't found or data is incomplete, kindly let the user know.
-        """
-        try:
-            res = self.groq.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            return res.choices[0].message.content.strip()
-        except Exception as e:
-            logger.error(f"Groq formatting error: {e}")
-            return "Sorry, I couldn't generate a helpful summary."
-
-    def get_flight_recommendations(self, user_query):
-        extracted = self.extract_with_groq(user_query)
-        logger.info(f"Extracted details: {extracted}")
-
-        required_fields = ["originCity", "destinationCity", "departureDate"]
-        if not all(field in extracted and extracted[field] for field in required_fields):
-            return {"error": "Missing essential flight details", "details": extracted}
-
-        flights = self.get_flights(
-            origin=extracted["originCity"],
-            destination=extracted["destinationCity"],
-            departure_date=extracted["departureDate"],
-            return_date=extracted.get("returnDate"),
-            passengers=extracted.get("passengers", 1)
-        )
-
-        reply = self.format_response_with_groq(user_query, flights)
-
-        return {
-            "extracted_input": extracted,
-            "api_response": flights,
-            "chatbot_response": reply
-        }
-
+    print("\n✅ Search complete! Thanks for using our Travel Assistant.")
 
 if __name__ == "__main__":
-    agent = FlightAgent()
-    query = input("Enter your travel request: ")
-    result = agent.get_flight_recommendations(query)
-
-    if "chatbot_response" in result:
-        print("\n Chatbot Response:\n" + result["chatbot_response"])
-    else:
-        print("\n Something went wrong.\nDetails:\n", json.dumps(result, indent=2))
+    main()
